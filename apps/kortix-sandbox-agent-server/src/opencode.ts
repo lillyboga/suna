@@ -22,7 +22,7 @@ export const OPENCODE_AUTH_PATH = `${OPENCODE_DATA_HOME}/opencode/auth.json`
 export const CODEX_AUTH_JSON_SECRET = 'CODEX_AUTH_JSON'
 export const OPENCODE_AUTH_JSON_SECRET = 'OPENCODE_AUTH_JSON'
 
-export function buildExecutorMcpConfigContent(env: NodeJS.ProcessEnv): string | undefined {
+export async function buildExecutorMcpConfigContent(env: NodeJS.ProcessEnv): Promise<string | undefined> {
   const executorToken = env.KORTIX_EXECUTOR_TOKEN
   const apiUrl = env.KORTIX_API_URL
   const llmBaseUrl = env.KORTIX_LLM_BASE_URL
@@ -77,7 +77,7 @@ export function buildExecutorMcpConfigContent(env: NodeJS.ProcessEnv): string | 
           baseURL: llmBaseUrl,
           apiKey: llmApiKey,
         },
-        models: KORTIX_GATEWAY_MODELS,
+        models: await fetchGatewayModels(llmBaseUrl, llmApiKey),
       },
     }
     if (!('model' in out) || typeof out.model !== 'string') {
@@ -86,6 +86,39 @@ export function buildExecutorMcpConfigContent(env: NodeJS.ProcessEnv): string | 
   }
 
   return JSON.stringify(out)
+}
+
+const GATEWAY_MODELS_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 8000]
+
+async function fetchGatewayModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<Record<string, KortixGatewayModel>> {
+  const url = `${baseUrl.replace(/\/+$/, '')}/models`
+  const attempts = GATEWAY_MODELS_RETRY_DELAYS_MS.length + 1
+  logger.info(`[opencode] fetching gateway models from ${url}`)
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { authorization: `Bearer ${apiKey}` } })
+      if (!res.ok) {
+        const detail = (await res.text().catch(() => '')).slice(0, 200)
+        throw new Error(`HTTP ${res.status}${detail ? ` ${detail}` : ''}`)
+      }
+      const body = (await res.json()) as { models?: Record<string, KortixGatewayModel> }
+      const models = body.models ?? {}
+      if (Object.keys(models).length === 0) throw new Error('gateway returned an empty catalog')
+      logger.info(`[opencode] fetched ${Object.keys(models).length} gateway models from ${url}`)
+      return models
+    } catch (err) {
+      logger.warn(
+        `[opencode] gateway models fetch failed (attempt ${attempt + 1}/${attempts}) ${url}: ${(err as Error).message}`,
+      )
+      const delay = GATEWAY_MODELS_RETRY_DELAYS_MS[attempt]
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay))
+    }
+  }
+  logger.error(`[opencode] gateway models unavailable after ${attempts} attempts (${url}); using minimal fallback`)
+  return MINIMAL_FALLBACK_MODELS
 }
 
 const DEFAULT_KORTIX_MODEL = 'kortix/anthropic/claude-opus-4.8'
@@ -99,89 +132,9 @@ type KortixGatewayModel = {
   limit?: { context?: number; output?: number }
 }
 
-const KORTIX_GATEWAY_MODELS: Record<string, KortixGatewayModel> = {
+const MINIMAL_FALLBACK_MODELS: Record<string, KortixGatewayModel> = {
   'anthropic/claude-opus-4.8': {
     name: 'Claude Opus 4.8',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_000_000, output: 64_000 },
-  },
-  'anthropic/claude-sonnet-4.6': {
-    name: 'Claude Sonnet 4.6',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_000_000, output: 64_000 },
-  },
-  'openai/gpt-5.5': {
-    name: 'GPT-5.5',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_050_000, output: 64_000 },
-  },
-  'google/gemini-3.5-flash': {
-    name: 'Gemini 3.5 Flash',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_048_576, output: 65_536 },
-  },
-  'google/gemini-3.1-pro-preview': {
-    name: 'Gemini 3.1 Pro',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_048_576, output: 65_536 },
-  },
-  'deepseek/deepseek-v4-flash': {
-    name: 'DeepSeek V4 Flash',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_048_576, output: 64_000 },
-  },
-  'deepseek/deepseek-v4-pro': {
-    name: 'DeepSeek V4 Pro',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_048_576, output: 64_000 },
-  },
-  'minimax/minimax-m3': {
-    name: 'MiniMax M3',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 1_048_576, output: 64_000 },
-  },
-  'moonshotai/kimi-k2.6': {
-    name: 'Kimi K2.6',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 262_144, output: 64_000 },
-  },
-  'z-ai/glm-5.1': {
-    name: 'GLM 5.1',
-    reasoning: true,
-    tool_call: true,
-    attachment: true,
-    temperature: true,
-    limit: { context: 202_752, output: 64_000 },
-  },
-  'x-ai/grok-4.3': {
-    name: 'Grok 4.3',
     reasoning: true,
     tool_call: true,
     attachment: true,
@@ -194,7 +147,14 @@ function materializeOpencodeAuth(env: NodeJS.ProcessEnv) {
   const authJson = env[CODEX_AUTH_JSON_SECRET] ?? env[OPENCODE_AUTH_JSON_SECRET]
   delete env[CODEX_AUTH_JSON_SECRET]
   delete env[OPENCODE_AUTH_JSON_SECRET]
-  if (!authJson?.trim()) return
+  if (!authJson?.trim()) {
+    try {
+      unlinkSync(OPENCODE_AUTH_PATH)
+      logger.info('[opencode] cleared stale Codex auth.json (no credential present)')
+    } catch {
+    }
+    return
+  }
 
   try {
     const parsed = JSON.parse(authJson)
@@ -297,7 +257,7 @@ export function createOpencodeSupervisor(
     } catch {}
   }
 
-  function spawnChild(bin: string) {
+  async function spawnChild(bin: string) {
     sweepBunExtractions()
     try {
       mkdirSync(OPENCODE_HOME, { recursive: true })
@@ -335,7 +295,7 @@ export function createOpencodeSupervisor(
       env.OPENCODE_LOG_LEVEL = 'DEBUG'
     }
 
-    const executorConfig = buildExecutorMcpConfigContent(baseEnv)
+    const executorConfig = await buildExecutorMcpConfigContent(baseEnv)
     if (executorConfig) {
       env.OPENCODE_CONFIG_CONTENT = executorConfig
       logger.info('[opencode] registered kortix-executor MCP server')
@@ -366,7 +326,7 @@ export function createOpencodeSupervisor(
       restartDelayMs = Math.min(restartDelayMs * 2, 30_000)
       logger.info('[opencode] restarting', { delayMs: delay })
       setTimeout(() => {
-        if (!stopping && binaryPath) spawnChild(binaryPath)
+        if (!stopping && binaryPath) void spawnChild(binaryPath)
       }, delay)
     })
 
@@ -415,7 +375,7 @@ export function createOpencodeSupervisor(
       binaryPath = bin
       opencodeCwd = await resolveOpencodeCwd(cfg)
       try {
-        spawnChild(bin)
+        await spawnChild(bin)
       } catch (err) {
         logger.error('[opencode] initial spawn failed', err)
       }
