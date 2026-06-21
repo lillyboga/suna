@@ -1,27 +1,17 @@
 /**
- * Ensures the database schema is up-to-date.
+ * Boot-time schema apply, delegating to packages/db/scripts/migrate.ts
+ * (node-pg-migrate; tracking in `kortix_migrations.pgmigrations`).
  *
- * Sequence:
- *   1. Run bootstrap migration (schemas, extensions, schema-level grants)
- *   2. `drizzle-kit push` (tables, indexes, enums — Drizzle-native)
- *   3. Run post-push migrations (table grants, atomic credit functions)
- *
- * SQL migrations live in supabase/migrations/ as individual files. Each file
- * may contain many statements; this runner sends each file as one
- * postgres.js `db.unsafe()` call (simple-query protocol = a single implicit
- * transaction), so any statement failing rolls back that whole file. Files
- * MUST therefore be individually idempotent (IF NOT EXISTS / guarded DO
- * blocks / ON CONFLICT) because the runner re-executes every file on each
- * boot. Errors are logged and swallowed (boot continues).
- *
- * In production (INTERNAL_KORTIX_ENV=prod), schema is managed by external
- * migration pipelines, so this is a no-op.
+ * Apply at boot ONLY when the DB is private to a single instance — local dev,
+ * or a self-hoster who sets KORTIX_AUTO_MIGRATE=1. Multi-replica / shared-DB
+ * deployments (Kortix cloud; preview branches share the dev DB) leave it off and
+ * are warn-only here; they apply migrations once in the deploy pipeline's
+ * migrate-db job (or `bun packages/db/scripts/migrate.ts up`) before serving.
  */
 
 import { join } from 'node:path';
-import { readFileSync, readdirSync } from 'node:fs';
-import { config } from './config';
 import postgres from 'postgres';
+import { config } from './config';
 
 export async function ensureSchema(): Promise<void> {
   if (!config.DATABASE_URL) {
@@ -29,85 +19,52 @@ export async function ensureSchema(): Promise<void> {
     return;
   }
 
-  if (process.env.KORTIX_SKIP_ENSURE_SCHEMA === '1') {
-    console.log('[schema] KORTIX_SKIP_ENSURE_SCHEMA=1 — skipping');
-    // Still probe the critical IAM surface so a stale dev DB shows up
-    // as a loud warning instead of opaque 500s on first request. Names
-    // listed here are the tables the IAM engine + auth middleware
-    // touch on every request — if they're missing, nothing in IAM
-    // works. We don't FAIL; the operator opted into skipping migrations.
+  const isLocalDev = process.env.KORTIX_LOCAL_DEV === '1' || process.env.ENV_MODE === 'local';
+  const autoMigrate = process.env.KORTIX_AUTO_MIGRATE === '1';
+
+  // Boot-time apply is OPT-IN, for cases where the app's database is private to
+  // a single instance: local dev, or a self-hoster who sets KORTIX_AUTO_MIGRATE=1.
+  // Multi-replica / shared-DB deployments (Kortix cloud; preview branches share
+  // the dev DB) must NOT migrate from boot — concurrent pods would race a
+  // half-applied state — so they leave this off and apply migrations once in the
+  // deploy pipeline (or `docker run <image> bun packages/db/scripts/migrate.ts up`)
+  // before the new code serves. At boot we only surface drift loudly.
+  if ((!isLocalDev && !autoMigrate) || process.env.KORTIX_SKIP_ENSURE_SCHEMA === '1') {
+    const reason =
+      process.env.KORTIX_SKIP_ENSURE_SCHEMA === '1'
+        ? 'KORTIX_SKIP_ENSURE_SCHEMA=1'
+        : `deployed env (INTERNAL_KORTIX_ENV=${config.INTERNAL_KORTIX_ENV}); set KORTIX_AUTO_MIGRATE=1 to apply at boot`;
+    console.log(
+      `[schema] ${reason} — not auto-applying (migrations are managed by the deploy pipeline). Checking for drift...`,
+    );
     await warnIfCriticalTablesMissing();
     return;
   }
 
-  // Production: schema managed externally (CI/CD migrations). Preview: ephemeral
-  // per-PR API shares the dev DB and must NEVER migrate it — schema changes are
-  // applied to dev deliberately, not by every preview pod at boot.
-  if (config.INTERNAL_KORTIX_ENV === 'prod' || config.INTERNAL_KORTIX_ENV === 'preview') {
-    console.log(`[schema] ${config.INTERNAL_KORTIX_ENV} mode — skipping auto-push (DB managed elsewhere)`);
+  const dbPkgRoot = join(import.meta.dir, '../../../packages/db');
+  const migratorPath = join(dbPkgRoot, 'scripts', 'migrate.ts');
+
+  console.log(
+    `[schema] ${isLocalDev ? 'Local dev' : 'KORTIX_AUTO_MIGRATE=1'} — applying pending migrations via migrate.ts...`,
+  );
+  const bunBin = process.execPath;
+  const proc = Bun.spawn([bunBin, migratorPath, 'up'], {
+    cwd: dbPkgRoot,
+    env: {
+      ...process.env,
+      DATABASE_URL: config.DATABASE_URL,
+    },
+    stdout: 'inherit',
+    stderr: 'inherit',
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    console.error(
+      `[schema] migrate up failed (exit ${exitCode}) — the application may misbehave until the operator fixes it.`,
+    );
     return;
   }
-
-  const migrationsDir = join(import.meta.dir, '../../../supabase/migrations');
-
-  // Step 1: Run bootstrap migration (schemas, extensions, grants)
-  console.log('[schema] Running bootstrap migration...');
-  await runSqlFile(join(migrationsDir, '00000000000000_bootstrap.sql'));
-
-  // Step 2: drizzle-kit push (tables, indexes, enums)
-  console.log('[schema] Pushing schema to database...');
-  const dbPkgRoot = join(import.meta.dir, '../../../packages/db');
-  const configPath = join(dbPkgRoot, 'drizzle.config.ts');
-
-  // Use the full path to bun so this works when spawned as a child process
-  // where PATH may not include ~/.bun/bin
-  const bunBin = process.execPath;
-  const proc = Bun.spawn(
-    [bunBin, 'drizzle-kit', 'push', '--force', '--config', configPath],
-    {
-      cwd: dbPkgRoot,
-      env: {
-        ...process.env,
-        DATABASE_URL: config.DATABASE_URL,
-      },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    },
-  );
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
-
-  if (exitCode !== 0) {
-    console.error('[schema] Push failed (exit', exitCode + ')');
-    if (stdout.trim()) console.error('[schema] stdout:', stdout.trim());
-    if (stderr.trim()) console.error('[schema] stderr:', stderr.trim());
-    return; // Don't run post-push if push failed
-  }
-
-  console.log('[schema] Schema pushed successfully');
-  if (stdout.trim()) {
-    const summary = stdout.trim().split('\n').filter((l: string) =>
-      l.includes('changes applied') || l.includes('CREATE') || l.includes('ALTER') || l.includes('No changes')
-    );
-    if (summary.length) console.log('[schema]', summary.join(' | '));
-  }
-
-  // Step 3: Run all post-push migrations (table grants, atomic functions)
-  // Each file is executed individually to avoid prepared-statement limits.
-  console.log('[schema] Running post-push migrations...');
-  const postPushFiles = readdirSync(migrationsDir)
-    .filter(f => f.endsWith('.sql') && f > '00000000000000_bootstrap.sql')
-    .sort();
-
-  for (const file of postPushFiles) {
-    await runSqlFile(join(migrationsDir, file));
-  }
-
-  console.log('[schema] All migrations complete');
+  console.log('[schema] Migrations complete.');
 }
 
 /**
@@ -144,49 +101,12 @@ async function warnIfCriticalTablesMissing(): Promise<void> {
     const present = new Set(rows.map((r) => r.table_name));
     const missing = required.filter((n) => !present.has(n));
     if (missing.length > 0) {
-      console.warn(
-        '[schema] ⚠ KORTIX_SKIP_ENSURE_SCHEMA=1 but critical tables are missing:',
-      );
+      console.warn('[schema] ⚠ KORTIX_SKIP_ENSURE_SCHEMA=1 but critical tables are missing:');
       for (const m of missing) console.warn(`[schema]   • kortix.${m}`);
-      console.warn(
-        '[schema] Run `bun run --cwd packages/db drizzle-kit push` or remove the env flag to auto-apply.',
-      );
+      console.warn('[schema] Run `pnpm migrate` or remove the env flag to auto-apply.');
     }
   } catch (err) {
-    console.warn(
-      '[schema] could not verify table presence:',
-      (err as Error).message ?? err,
-    );
-  } finally {
-    await db.end();
-  }
-}
-
-/**
- * Execute a raw SQL file against the database.
- * Uses postgres.js for direct connection (not Supabase client).
- */
-async function runSqlFile(filePath: string): Promise<void> {
-  const fileName = filePath.split('/').pop();
-  let sql: string;
-  try {
-    sql = readFileSync(filePath, 'utf-8');
-  } catch (err) {
-    console.warn(`[schema] Migration file not found: ${fileName} — skipping`);
-    return;
-  }
-
-  const db = postgres(config.DATABASE_URL!, { max: 1 });
-  try {
-    await db.unsafe(sql);
-    console.log(`[schema] ✓ ${fileName}`);
-  } catch (err: any) {
-    // pg_cron/pg_net extensions may not exist in local dev — that's OK
-    if (err.message?.includes('pg_cron') || err.message?.includes('pg_net')) {
-      console.log(`[schema] ⚠ ${fileName}: pg_cron/pg_net extension not available (OK for local dev)`);
-    } else {
-      console.error(`[schema] ✗ ${fileName}:`, err.message || err);
-    }
+    console.warn('[schema] could not verify table presence:', (err as Error).message ?? err);
   } finally {
     await db.end();
   }
