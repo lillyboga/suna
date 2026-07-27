@@ -328,13 +328,31 @@ const BARE_CLONE_TIMEOUT_MS = bareCloneTimeoutMs();
 const BARE_CLONE_MAX_ATTEMPTS = 2;
 const BARE_CLONE_RETRY_DELAY_MS = 500;
 
+function looksLikeBareMirror(repoPath: string): boolean {
+  return (
+    existsSync(join(repoPath, 'HEAD')) &&
+    existsSync(join(repoPath, 'config')) &&
+    existsSync(join(repoPath, 'objects')) &&
+    existsSync(join(repoPath, 'refs'))
+  );
+}
+
 async function doRefreshMirror(project: GitBackedProject, force = false) {
   const repoPath = repoCachePath(project);
   await mkdir(dirname(repoPath), { recursive: true });
   if (existsSync(join(repoPath, 'shallow'))) {
     await rm(repoPath, { recursive: true, force: true });
   }
-  const needsClone = !existsSync(repoPath);
+  let needsClone = !existsSync(repoPath);
+  if (!needsClone && !looksLikeBareMirror(repoPath)) {
+    // Self-heal a poisoned cache entry. This can happen if a previous clone was
+    // killed before git wrote a bare repo, or if an external cleanup left the
+    // hashed cache path as a plain directory. Without this guard a warm read can
+    // surface "fatal: not a git repository" all the way up to session startup.
+    await rm(repoPath, { recursive: true, force: true });
+    lastRefreshAt.delete(project.projectId);
+    needsClone = true;
+  }
   const lastRefresh = lastRefreshAt.get(project.projectId) || 0;
   const needsFetch = !needsClone && (force || Date.now() - lastRefresh >= refreshIntervalMs());
   // Nothing to do over the network — serve the warm cache without touching git.
